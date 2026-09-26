@@ -1,0 +1,20 @@
+# Virtual environment (the Python "node_modules")
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment secrets
+.env
+
+# OS / editor junk
+.DS_Store
+.vscode/
+.idea/
