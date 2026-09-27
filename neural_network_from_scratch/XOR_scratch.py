@@ -68,6 +68,9 @@ print(f"Initial Loss (untrained): {initial_loss:.4f}")
 print("\nThis number should decrease as we train.")
 print("\n")
 
+
+# _, _, _, final_predictions = forward_pass(X)
+
 def backward(input_data, expected_output, hidden_layer_without_activ, hidden_layer_activ, output_layer_without_activ, output_layer_activ, learning_rate):
     global weights_input_hidden, bias_hidden, weights_hidden_output, bias_output
     m = input_data.shape[0]
@@ -95,7 +98,7 @@ print("This is the 'learning' part — adjusting weights to reduce error.")
 
 # print(z_o)
 learning_rate = 2.0
-iterations = 100000
+iterations = 900000
 
 np.random.seed(42)
 weights_input_hidden = np.random.randn(INPUT_SIZE, HIDDEN_SIZE) * 0.5

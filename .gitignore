@@ -1,6 +1,6 @@
 # Virtual environment (the Python "node_modules")
-venv/
-.venv/
+**/venv/
+**/.venv/
 env/
 
 # Python cache
