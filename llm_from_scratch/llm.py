@@ -1,0 +1,362 @@
+import subprocess
+import torch
+import os
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.functional as F
+import math
+import time
+
+DROPOUT = 0.1  
+
+device = "mps" if torch.backends.mps.is_built() else "CPU"
+
+print(f"Using Device: {device}")
+if torch.backends.mps.is_available():
+    cmd = "system_profiler SPDisplaysDataType | grep 'Chipset Model'"
+    gpu_name = subprocess.check_output(cmd, shell=True).decode().split(":")[-1].strip()
+    print(f"GPU: {gpu_name}")
+
+DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+output_file = "shakespeare.txt"
+
+if not os.path.exists(output_file):
+    import urllib.request
+    urllib.request.urlretrieve(DATA_URL, output_file)
+    print("Download complete.")
+else:
+    print(f"{output_file} already exists. Skipping download.")
+
+with open("shakespeare.txt", "r") as f:
+    text = f.read()
+    
+
+print(f"Content successfully saved to {output_file}")
+
+# creating tokens
+# character level
+
+chars = sorted(set(text))
+vocab_size = len(chars)
+char_to_idx = {c:i for i,c in enumerate(chars)}
+idx_to_char = {i:c for i,c in enumerate(chars)}
+
+def encode(string):
+    return [char_to_idx[c] for c in string]
+
+def decode(code):
+    return "".join([idx_to_char[c] for c in code])
+
+
+# splitting between training and validation set
+data = torch.tensor(encode(text), dtype=torch.long)
+n = int(0.9 * len(data))
+train_data = data[:n]
+validation_data = data[n:]
+
+print(f"Training tokens:   {len(train_data):,}")
+print(f"Validation tokens: {len(validation_data):,}")
+
+def get_batch(split, batch_size, context_length):
+    d = train_data if split == "train" else validation_data
+    ix = torch.randint(len(d) - context_length, (batch_size,))
+    x = torch.stack([d[i: i+context_length] for i in ix])
+    y = torch.stack([d[i+1: i+context_length+1] for i in ix])
+    return x.to(device), y.to(device)
+
+xb, yb = get_batch("train", batch_size=4, context_length=8)
+print(f"Input shape:  {xb.shape}  (batch_size x context_length)")
+print(f"Target shape: {yb.shape}")
+print(f"\nExample (first sequence):")
+print(f"  Input:  {decode(xb[0].tolist())!r}")
+print(f"  Target: {decode(yb[0].tolist())!r}")
+print(f"  (Target is input shifted by 1 character)")
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x / rms) * self.weight
+
+def precompute_rope_freqs(head_dim, max_seq_len, base=10000.0):
+    freqs = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    positions = torch.arange(max_seq_len).float()
+    angles = torch.outer(positions, freqs)  # [max_seq_len, head_dim // 2]
+    return torch.cos(angles), torch.sin(angles)
+
+def apply_rope(x, cos, sin):
+    seq_len = x.shape[2]
+    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)  # [1, 1, seq, hd//2]
+    sin = sin[:seq_len].unsqueeze(0).unsqueeze(0)
+
+    x1 = x[..., ::2]   # even dims
+    x2 = x[..., 1::2]  # odd dims
+
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+
+    return torch.stack([out1, out2], dim=-1).flatten(-2)
+
+def repeat_kv(x, n_rep):
+    """
+    Repeat KV heads to match the number of query heads.
+    x: [batch, n_kv_heads, seq_len, head_dim]
+    Returns: [batch, n_kv_heads * n_rep, seq_len, head_dim]
+    """
+    if n_rep == 1:
+        return x
+    b, n_kv, seq, hd = x.shape
+    return (x[:, :, None, :, :]
+            .expand(b, n_kv, n_rep, seq, hd)
+            .reshape(b, n_kv * n_rep, seq, hd))
+
+class GroupedQueryAttention(nn.Module):
+    """
+    Grouped Query Attention with RoPE.
+    n_heads query heads, n_kv_heads key/value heads.
+    Groups of (n_heads // n_kv_heads) query heads share one KV pair.
+    """
+    def __init__(self, d_model, n_heads, n_kv_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        assert n_heads % n_kv_heads == 0
+
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_rep = n_heads // n_kv_heads
+        self.head_dim = d_model // n_heads
+
+        self.q_proj = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+
+    def forward(self, x, rope_cos, rope_sin):
+        b, seq, _ = x.shape
+
+        # Project Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape into heads
+        q = q.view(b, seq, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(b, seq, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, seq, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE to Q and K (not V!)
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
+
+        # Repeat KV heads to match Q heads
+        k = repeat_kv(k, self.n_rep)
+        v = repeat_kv(v, self.n_rep)
+
+        # Scaled dot-product attention with causal mask
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = (q @ k.transpose(-2, -1)) * scale
+
+        mask = torch.triu(torch.ones(seq, seq, device=x.device), diagonal=1).bool()
+        scores = scores.masked_fill(mask, float("-inf"))
+
+        weights = F.softmax(scores, dim=-1)
+
+        # Dropout on attention weights (regularization)
+        weights = F.dropout(weights, p=DROPOUT, training=self.training)
+
+        out = weights @ v
+
+        # Merge heads and project
+        out = out.transpose(1, 2).contiguous().view(b, seq, -1)
+        return self.o_proj(out)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, hidden_dim):
+        super().__init__()
+        self.w_gate = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w_up   = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w_down = nn.Linear(hidden_dim, d_model, bias=False)
+
+    def forward(self, x):
+        gate = F.silu(self.w_gate(x))
+        up   = self.w_up(x)
+        return F.dropout(self.w_down(gate * up), p=DROPOUT, training=self.training)
+
+class TransformerBlock(nn.Module):
+    """
+    One layer of a modern transformer.
+
+    Pre-norm architecture:
+      x -> RMSNorm -> GQA Attention -> + residual
+      x -> RMSNorm -> SwiGLU FFN     -> + residual
+    """
+    def __init__(self, d_model, n_heads, n_kv_heads, ffn_hidden_dim):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.attention = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+        self.ffn_norm  = RMSNorm(d_model)
+        self.ffn       = SwiGLU(d_model, ffn_hidden_dim)
+
+    def forward(self, x, rope_cos, rope_sin):
+        # Pre-norm -> Attention -> Residual
+        x = x + self.attention(self.attn_norm(x), rope_cos, rope_sin)
+        # Pre-norm -> FFN -> Residual
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+class MiniLLM(nn.Module):
+    """
+    A small but modern language model.
+
+    Architecture: modern transformer with all 4 upgrades.
+    Training objective: next character prediction.
+    """
+    def __init__(self, vocab_size, d_model, n_layers, n_heads, n_kv_heads,
+                 ffn_hidden_dim, max_seq_len):
+        super().__init__()
+
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+
+        # Token embedding (no positional embedding -- RoPE handles position)
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+
+        # Transformer blocks
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, n_kv_heads, ffn_hidden_dim)
+            for _ in range(n_layers)
+        ])
+
+        # Final norm and output head
+        self.final_norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # Weight tying: share embedding and output weights
+        self.lm_head.weight = self.token_emb.weight
+
+        # Precompute RoPE frequencies
+        head_dim = d_model // n_heads
+        rope_cos, rope_sin = precompute_rope_freqs(head_dim, max_seq_len)
+        self.register_buffer("rope_cos", rope_cos)
+        self.register_buffer("rope_sin", rope_sin)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        b, seq_len = idx.shape
+
+        # Token embedding
+        x = self.token_emb(idx)
+
+        # Pass through transformer blocks
+        for layer in self.layers:
+            x = layer(x, self.rope_cos, self.rope_sin)
+
+        # Final norm + project to vocabulary
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1)
+            )
+
+        return logits, loss
+
+config = {
+    "vocab_size":     vocab_size,
+    "d_model":        256,
+    "n_layers":       4,
+    "n_heads":        8,
+    "n_kv_heads":     2,
+    "ffn_hidden_dim": 680,
+    "max_seq_len":    256,
+}
+
+model = MiniLLM(**config).to(device)
+
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# --- Training Hyperparameters ---
+BATCH_SIZE = 64
+CONTEXT_LEN = config["max_seq_len"]
+LEARNING_RATE = 3e-4
+MAX_STEPS = 3000
+EVAL_INTERVAL = 250
+EVAL_STEPS = 20
+LOG_INTERVAL = 50
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+@torch.no_grad()
+def estimate_loss():
+    """Estimate loss on train and val splits."""
+    model.eval()
+    out = {}
+    for split in ["train", "val"]:
+        losses = []
+        for _ in range(EVAL_STEPS):
+            xb, yb = get_batch(split, BATCH_SIZE, CONTEXT_LEN)
+            _, loss = model(xb, yb)
+            losses.append(loss.item())
+        out[split] = sum(losses) / len(losses)
+    model.train()
+    return out
+
+# --- Training Loop ---
+print("Starting training...")
+print(f"  {MAX_STEPS} steps, batch_size={BATCH_SIZE}, context_len={CONTEXT_LEN}")
+print(f"  Evaluating every {EVAL_INTERVAL} steps")
+print("-" * 60)
+
+train_losses = []
+val_losses = []
+step_log = []
+start_time = time.time()
+
+model.train()
+for step in range(MAX_STEPS):
+    xb, yb = get_batch("train", BATCH_SIZE, CONTEXT_LEN)
+
+    logits, loss = model(xb, yb)
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+    if step % LOG_INTERVAL == 0:
+        elapsed = time.time() - start_time
+        print(f"  Step {step:5d}/{MAX_STEPS} | Loss: {loss.item():.4f} | Time: {elapsed:.0f}s")
+
+    if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
+        losses = estimate_loss()
+        train_losses.append(losses["train"])
+        val_losses.append(losses["val"])
+        step_log.append(step)
+        if step > 0:
+            elapsed = time.time() - start_time
+            steps_per_sec = step / elapsed
+            remaining = (MAX_STEPS - step) / steps_per_sec
+            print(f"  >>> Eval @ step {step}: train={losses['train']:.4f}, val={losses['val']:.4f} | ~{remaining:.0f}s remaining")
+
+total_time = time.time() - start_time
+print("-" * 60)
+print(f"Training complete! Total time: {total_time:.0f}s ({total_time/60:.1f} min)")
+print(f"Final train loss: {train_losses[-1]:.4f}")
+print(f"Final val loss:   {val_losses[-1]:.4f}")
